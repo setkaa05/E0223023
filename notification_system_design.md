@@ -322,3 +322,160 @@ WHERE student_id = $1 AND is_read = false;
 ```
 
 ---
+
+## Stage 3
+
+### Query Analysis
+
+**Original query:**
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+**Is it accurate?**
+
+Mostly, but with two issues:
+1. `ORDER BY createdAt ASC` returns oldest-first. For a notification inbox users almost always want newest-first (`DESC`).
+2. No `LIMIT` — can return thousands of rows to the application layer.
+
+**Why is it slow at 50k students / 5M notifications?**
+
+1. No composite index on `(studentID, isRead)` — full scan of student's rows then filter in memory.
+2. `SELECT *` fetches every column including large `message` TEXT fields.
+3. `ORDER BY createdAt` triggers an in-memory sort on the filtered result set.
+4. No `LIMIT` — all matching rows transferred to the application.
+
+**What to change:**
+```sql
+SELECT id, type, message, created_at
+FROM notifications
+WHERE student_id = $1 AND is_read = false
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+Add a partial index:
+```sql
+CREATE INDEX idx_notif_unread_student
+ON notifications(student_id, created_at DESC)
+WHERE is_read = false;
+```
+
+Cost before: O(n) full scan. Cost after: O(log n + k) index seek.
+
+**Is indexing every column a good idea?** No. Every index slows INSERT/UPDATE/DELETE, consumes disk, and confuses the query planner. Only index columns used in WHERE, JOIN ON, ORDER BY of frequent queries.
+
+**Students with Placement notification in the last 7 days:**
+```sql
+SELECT DISTINCT s.id, s.name, s.email
+FROM students s
+INNER JOIN notifications n ON n.student_id = s.id
+WHERE n.type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days';
+```
+
+---
+
+## Stage 4
+
+### Caching Strategy
+
+**Problem:** Every page load hits the DB with a SELECT per student.
+
+**Strategy 1: Redis Cache**
+Cache notification list per student, TTL 60s. Invalidate on new notification or read change.
+- Pro: Near-zero DB load; sub-millisecond responses
+- Con: Stale data up to TTL; Redis infra overhead; invalidation complexity
+
+**Strategy 2: HTTP ETags**
+ETag from latest notification timestamp. Return 304 Not Modified on match.
+- Pro: Zero bandwidth for unchanged data; no extra infra
+- Con: Still hits server for ETag check
+
+**Strategy 3: Cursor-based Pagination**
+Fetch pages using a cursor (last seen created_at) instead of offset.
+- Pro: Smaller queries; each page independently cacheable
+- Con: Cannot jump to page N; requires client state
+
+**Strategy 4: Client-side Cache**
+Store in localStorage/IndexedDB, refresh in background.
+- Pro: Instant perceived load; works offline
+- Con: Stale across devices; unbounded growth
+
+**Recommended:** Redis + cursor pagination. Cache each page independently, invalidate on write.
+
+---
+
+## Stage 5
+
+### Bulk Notification — Redesign
+
+**Shortcomings in original pseudocode:**
+1. Sequential loop over 50k students is unacceptably slow (~42 min at 50ms/student)
+2. One failure blocks all remaining students — no error isolation
+3. No retry for transient failures
+4. No way to identify which 200 students failed without re-running everything
+5. Email down = in-app notifications also blocked (tight coupling)
+6. HR has no progress feedback
+
+**Should DB write and email happen together?** No.
+- DB write is synchronous and must succeed (source of truth for in-app)
+- Email is best-effort async — coupling them means a flaky email API blocks all in-app notifications
+
+**Redesigned pseudocode:**
+```python
+function notify_all(message, type):
+  student_ids = fetch_all_student_ids()
+  job_id = create_job(len(student_ids))
+  try:
+    begin_transaction()
+    for batch in chunk(student_ids, 1000):
+      bulk_insert_notifications(batch, message, type)
+      bulk_insert_email_queue(batch, message, job_id)  # outbox pattern
+    commit_transaction()
+  except Exception as e:
+    rollback_transaction()
+    return { error: "failed to queue notifications" }
+  emit_to_all_connected_clients(message, type)
+  return { jobId: job_id, status: "processing" }
+
+# Separate worker
+function process_email_queue():
+  while True:
+    batch = fetch_pending_emails(500)
+    for item in batch:
+      try:
+        send_email(item.student_id, item.message)
+        mark_email_sent(item.id)
+      except:
+        if item.retry_count < 3:
+          requeue_with_backoff(item)
+        else:
+          mark_email_failed(item.id)
+```
+
+---
+
+## Stage 6
+
+### Priority Inbox
+
+**Scoring formula:**
+```
+typeWeight: Placement=3, Result=2, Event=1
+recencyScore = 1000 / (minutesSinceCreated + 1)
+priorityScore = typeWeight * 100 + recencyScore
+```
+
+Recent Placement always outranks older Placement. A very recent Result can outrank a stale Placement.
+
+**Efficient top-N with new notifications arriving:**
+Use a min-heap of size N. On each new notification:
+1. Compute score
+2. If heap has fewer than N items — push
+3. If score > heap minimum — replace minimum with new item
+4. O(log N) per insertion — efficient at any throughput
+
+Implementation is in `stage6_priority/index.ts`.
