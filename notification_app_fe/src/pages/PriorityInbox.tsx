@@ -27,7 +27,7 @@ export default function PriorityInbox() {
     try {
       await Log('frontend', 'info', 'component', `Loading priority inbox topN=${topN}`)
       // fetch a larger set so we have enough to rank
-      const data = await fetchNotifications({ limit: 100 })
+      const data = await fetchNotifications({})
       setAll(data)
     } catch (err) {
       await Log('frontend', 'error', 'service', `Priority inbox load failed: ${err}`)
